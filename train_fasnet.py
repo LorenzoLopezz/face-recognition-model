@@ -102,18 +102,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Entrenamiento con k-fold cross-validation para maximizar uso de datos'
     )
-    parser.add_argument('--data_dir', required=True,
-                        help='Directorio con carpeta train/real y train/spoof')
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Épocas por fold (default=50)')
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size (default=16)')
-    parser.add_argument('--lr', type=float, default=3e-5,
-                        help='Learning rate inicial (default=3e-5)')
-    parser.add_argument('--output_model', default='fasnet_cv.h5',
-                        help='Archivo final del mejor modelo')
-    parser.add_argument('--folds', type=int, default=5,
-                        help='Número de folds para CV (default=5)')
+    parser.add_argument('--data_dir', required=True, help='Directorio con carpeta train/real y train/spoof')
+    parser.add_argument('--epochs', type=int, default=50, help='Épocas por fold (default=50)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size (default=16)')
+    parser.add_argument('--lr', type=float, default=3e-5, help='Learning rate inicial (default=3e-5)')
+    parser.add_argument('--output_model', default='fasnet_cv.h5', help='Archivo final del mejor modelo')
+    parser.add_argument('--folds', type=int, default=5, help='Número de folds para CV (default=5)')
     args = parser.parse_args()
 
     df = make_dataframe(args.data_dir)
@@ -122,6 +116,11 @@ def main():
     best_val_loss = np.inf
     best_model_weights = None
     best_val_acc = 0
+    
+    min_val_acc = 0.80
+    max_val_acc = 0.90
+    min_val_loss = 0
+    max_val_loss = 0.18
 
     # Cross-validation
     for fold, (train_idx, val_idx) in enumerate(skf.split(df['filepath'], df['class'])):
@@ -135,19 +134,14 @@ def main():
         )
         class_weights = compute_class_weights_from_df(train_df)
 
-        model = build_fasnet(input_shape=(224,224,3),
-                             l2_reg=1e-6, dropout_rate=0.3)
+        model = build_fasnet(input_shape=(224,224,3), l2_reg=1e-6, dropout_rate=0.3)
         freeze_backbone_except_block5(model)
         optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
-        model.compile(optimizer=optimizer,
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
+        model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
         callbacks = [
-            EarlyStopping(monitor='val_loss', patience=2,
-                          restore_best_weights=True, verbose=1),
-            ModelCheckpoint(f"fold_{fold+1}_best.h5",
-                            monitor='val_loss', save_best_only=True, verbose=1)
+            EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1),
+            ModelCheckpoint(f"fold_{fold+1}_best.h5", monitor='val_loss', save_best_only=True, verbose=1)
         ]
 
         history = model.fit(
@@ -163,27 +157,26 @@ def main():
         val_acc = max(history.history['val_accuracy'])
         print(f"[INFO] Fold {fold+1} - Mejor val_loss: {val_loss:.4f}, val_accuracy: {val_acc:.4f}")
 
-        # Guardar mejor modelo solo si accuracy está en el rango deseado (70% - 86%)
-        if 0.70 <= val_acc <= 0.86:
+        # Guardar mejor modelo solo si las métricas están en el rango deseado
+        if (min_val_acc <= val_acc <= max_val_acc) and (min_val_loss <= val_loss <= max_val_loss):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_val_acc = val_acc
                 best_model_weights = model.get_weights()
                 print(f"[INFO] Nuevo mejor modelo encontrado en fold {fold+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
         else:
-            print(f"[INFO] Fold {fold+1} descartado - val_accuracy {val_acc:.4f} fuera del rango [0.70, 0.86]")
+            print(f"[INFO] Fold {fold+1} descartado - val_accuracy {val_acc:.4f} o val_loss {val_loss:.4f} fuera del rango.")
 
     # Guardar pesos del mejor fold
     if best_model_weights is not None:
-        best_model = build_fasnet(input_shape=(224,224,3),
-                                l2_reg=1e-6, dropout_rate=0.3)
+        best_model = build_fasnet(input_shape=(224,224,3), l2_reg=1e-6, dropout_rate=0.3)
         freeze_backbone_except_block5(best_model)
         best_model.set_weights(best_model_weights)
         best_model.save(args.output_model)
         print(f"\n[INFO] Mejor modelo guardado en {args.output_model}")
         print(f"[INFO] Métricas del modelo guardado - val_loss: {best_val_loss:.4f}, val_accuracy: {best_val_acc:.4f}")
     else:
-        print(f"\n[WARNING] No se encontró ningún modelo con accuracy en el rango [0.70, 0.86]")
+        print(f"\n[WARNING] No se encontró ningún modelo con métricas en el rango: Acc [{min_val_acc:.2f}-{max_val_acc:.2f}], Loss [{min_val_loss:.2f}-{max_val_loss:.2f}]")
         print(f"[WARNING] No se guardó ningún modelo en {args.output_model}")
 
 if __name__ == '__main__':

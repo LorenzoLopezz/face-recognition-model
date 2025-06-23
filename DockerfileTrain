@@ -19,7 +19,6 @@ RUN pip install --upgrade pip \
 
 # 4. Copia tus scripts
 COPY train_fasnet.py .
-COPY fine_tune_fasnet.py .
 
 # 5. Monta el dataset y el modelo desde el host
 VOLUME ["/app/data", "/app/model"]
