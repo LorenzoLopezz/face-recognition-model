@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train_fasnet.py
+# train_fasnet.py (modificado: recomendaciones 1, 4, 5 y 9, ajustado para focal loss y sin L2)  
 
 import os
 import argparse
@@ -7,30 +7,33 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.applications import VGG16
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
+from tensorflow.keras.applications.vgg16 import preprocess_input
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import (
     EarlyStopping,
-    ModelCheckpoint
+    ModelCheckpoint,
+    ReduceLROnPlateau,
+    TensorBoard
 )
-from tensorflow.keras.regularizers import l2
+import tensorflow_addons as tfa
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import StratifiedKFold
 
 
-def build_fasnet(input_shape=(224,224,3), l2_reg=1e-6, dropout_rate=0.3):
+def build_fasnet(input_shape=(224,224,3), dropout_rate=0.5):
     """
-    Construye FASNet con VGG16 base y cabeza regularizada.
+    Construye FASNet con VGG16 base y cabeza regularizada (BatchNorm + Dropout).
     """
     base = VGG16(include_top=False, weights='imagenet', input_shape=input_shape)
     x = base.output
     x = GlobalAveragePooling2D()(x)
-    x = Dense(256, activation='relu', kernel_regularizer=l2(l2_reg))(x)
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
     x = Dropout(dropout_rate)(x)
-    outputs = Dense(2, activation='softmax', kernel_regularizer=l2(l2_reg))(x)
-    model = Model(inputs=base.input, outputs=outputs)
-    return model
+    outputs = Dense(2, activation='softmax')(x)
+    return Model(inputs=base.input, outputs=outputs)
 
 
 def freeze_backbone_except_block5(model):
@@ -38,15 +41,12 @@ def freeze_backbone_except_block5(model):
     Congela todas las capas de VGG16 excepto las de block5.
     """
     for layer in model.layers:
-        if layer.name.startswith('block5_'):
-            layer.trainable = True
-        else:
-            layer.trainable = False
+        layer.trainable = layer.name.startswith('block5_') or not layer.name.startswith('block')
 
 
 def make_dataframe(data_dir):
     """
-    Crea un DataFrame con ruta de archivo y etiqueta (real/spoof).
+    Crea DataFrame con ruta y clase (real/spoof).
     """
     filepaths, labels = [], []
     for cls in ['real', 'spoof']:
@@ -60,16 +60,20 @@ def make_dataframe(data_dir):
 
 def get_generators(train_df, val_df, img_size=(224,224), batch_size=32):
     """
-    Generadores simples con augmentaciones suaves.
+    Generadores con augmentaciones usando preprocess_input.
     """
     train_datagen = ImageDataGenerator(
-        rescale=1./255,
+        preprocessing_function=preprocess_input,
         horizontal_flip=True,
-        rotation_range=5,
-        zoom_range=0.05,
-        shear_range=0.05
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        brightness_range=(0.8,1.2),
+        zoom_range=0.1,
+        shear_range=0.1,
+        fill_mode='nearest'
     )
-    val_datagen = ImageDataGenerator(rescale=1./255)
+    val_datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
 
     train_gen = train_datagen.flow_from_dataframe(
         train_df, x_col='filepath', y_col='class',
@@ -86,105 +90,100 @@ def get_generators(train_df, val_df, img_size=(224,224), batch_size=32):
 
 def compute_class_weights_from_df(df):
     """
-    Calcula pesos de clase a partir de etiquetas en DataFrame.
+    Calcula pesos de clase.
     """
     labels = df['class'].map({'real':0, 'spoof':1}).values
     classes = np.unique(labels)
-    weights = compute_class_weight(
-        class_weight='balanced',
-        classes=classes,
-        y=labels
-    )
+    weights = compute_class_weight('balanced', classes=classes, y=labels)
     return {int(c): w for c, w in zip(classes, weights)}
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Entrenamiento con k-fold cross-validation para maximizar uso de datos'
-    )
-    parser.add_argument('--data_dir', required=True,
-                        help='Directorio con carpeta train/real y train/spoof')
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Épocas por fold (default=50)')
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size (default=16)')
-    parser.add_argument('--lr', type=float, default=3e-5,
-                        help='Learning rate inicial (default=3e-5)')
-    parser.add_argument('--output_model', default='fasnet_cv.h5',
-                        help='Archivo final del mejor modelo')
-    parser.add_argument('--folds', type=int, default=5,
-                        help='Número de folds para CV (default=5)')
+    parser = argparse.ArgumentParser(description='Entrenamiento con k-fold CV')
+    parser.add_argument('--data_dir', required=True, help='Directorio con train/real y train/spoof')
+    parser.add_argument('--epochs', type=int, default=50, help='Épocas por fold')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--lr', type=float, default=3e-5, help='Learning rate inicial')
+    parser.add_argument('--output_model', default='fasnet_cv.h5', help='Modelo final')
+    parser.add_argument('--folds', type=int, default=5, help='Número de folds')
     args = parser.parse_args()
+
+    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs('history', exist_ok=True)
 
     df = make_dataframe(args.data_dir)
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=42)
 
     best_val_loss = np.inf
-    best_model_weights = None
     best_val_acc = 0
+    best_weights = None
 
-    # Cross-validation
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df['filepath'], df['class'])):
-        print(f"\n[INFO] Fold {fold+1}/{args.folds}")
-        train_df = df.iloc[train_idx]
-        val_df = df.iloc[val_idx]
+    # Rangos de métricas
+    min_acc, max_acc = 0.80, 0.90
+    min_loss, max_loss = 0, 0.15
 
-        train_gen, val_gen = get_generators(
-            train_df, val_df,
-            img_size=(224,224), batch_size=args.batch_size
-        )
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df['filepath'], df['class']), 1):
+        print(f"[INFO] Fold {fold}/{args.folds}")
+        train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
+
+        train_gen, val_gen = get_generators(train_df, val_df, batch_size=args.batch_size)
         class_weights = compute_class_weights_from_df(train_df)
 
-        model = build_fasnet(input_shape=(224,224,3),
-                             l2_reg=1e-6, dropout_rate=0.3)
+        model = build_fasnet(dropout_rate=0.5)
         freeze_backbone_except_block5(model)
+
         optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
-        model.compile(optimizer=optimizer,
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
+        loss_fn = tfa.losses.SigmoidFocalCrossEntropy(
+            alpha=0.25, gamma=2.0, from_logits=False,
+            reduction=tf.keras.losses.Reduction.AUTO
+        )
+        model.compile(
+            optimizer=optimizer,
+            loss=loss_fn,
+            metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+        )
 
         callbacks = [
-            EarlyStopping(monitor='val_loss', patience=2,
-                          restore_best_weights=True, verbose=1),
-            ModelCheckpoint(f"fold_{fold+1}_best.h5",
-                            monitor='val_loss', save_best_only=True, verbose=1)
+            EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1),
+            ModelCheckpoint('checkpoints/fold_%d_best.h5' % fold, monitor='val_loss', save_best_only=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, verbose=1),
+            TensorBoard(log_dir=os.path.join('logs', f'fold_{fold}'))
         ]
 
         history = model.fit(
             train_gen,
             validation_data=val_gen,
             epochs=args.epochs,
+            batch_size=args.batch_size,
             callbacks=callbacks,
             class_weight=class_weights,
             verbose=1
         )
 
-        val_loss = min(history.history['val_loss'])
-        val_acc = max(history.history['val_accuracy'])
-        print(f"[INFO] Fold {fold+1} - Mejor val_loss: {val_loss:.4f}, val_accuracy: {val_acc:.4f}")
+        hist_df = pd.DataFrame(history.history)
+        hist_df.to_csv(f"history/history_fold_{fold}.csv", index=False)
 
-        # Guardar mejor modelo solo si accuracy está en el rango deseado (70% - 86%)
-        if 0.70 <= val_acc <= 0.86:
+        val_loss = hist_df['val_loss'].min()
+        val_acc = hist_df['val_accuracy'].max()
+        print(f"[INFO] Fold {fold} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
+
+        if min_acc <= val_acc <= max_acc and min_loss <= val_loss <= max_loss:
             if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_val_acc = val_acc
-                best_model_weights = model.get_weights()
-                print(f"[INFO] Nuevo mejor modelo encontrado en fold {fold+1} - val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}")
+                best_val_loss, best_val_acc = val_loss, val_acc
+                best_weights = model.get_weights()
+                print(f"[INFO] Nuevo mejor modelo en fold {fold}")
         else:
-            print(f"[INFO] Fold {fold+1} descartado - val_accuracy {val_acc:.4f} fuera del rango [0.70, 0.86]")
+            print(f"[INFO] Fold {fold} descartado - métricas fuera de rango")
 
-    # Guardar pesos del mejor fold
-    if best_model_weights is not None:
-        best_model = build_fasnet(input_shape=(224,224,3),
-                                l2_reg=1e-6, dropout_rate=0.3)
+    if best_weights is not None:
+        best_model = build_fasnet(dropout_rate=0.5)
         freeze_backbone_except_block5(best_model)
-        best_model.set_weights(best_model_weights)
+        best_model.set_weights(best_weights)
         best_model.save(args.output_model)
-        print(f"\n[INFO] Mejor modelo guardado en {args.output_model}")
-        print(f"[INFO] Métricas del modelo guardado - val_loss: {best_val_loss:.4f}, val_accuracy: {best_val_acc:.4f}")
+        print(f"[INFO] Mejor modelo guardado: {args.output_model} (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f})")
     else:
-        print(f"\n[WARNING] No se encontró ningún modelo con accuracy en el rango [0.70, 0.86]")
-        print(f"[WARNING] No se guardó ningún modelo en {args.output_model}")
+        print("[WARNING] No se guardó ningún modelo. Revisa los rangos de métricas.")
 
 if __name__ == '__main__':
     main()
